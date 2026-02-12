@@ -3,21 +3,37 @@ package cmd
 import (
 	"context"
 	"fmt"
-	"math/rand"
+	"net"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"time"
 
 	"github.com/NjariaOwen/sb-hub/pkg"
 	"github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/client"
+	"github.com/docker/go-connections/nat"
 	"github.com/spf13/cobra"
 )
 
+func FindFreePort(start, end int, used map[string]bool) int {
+	for port := start; port <= end; port++ {
+		pStr := fmt.Sprintf("%d", port)
+		if used[pStr] {
+			continue
+		}
+		ln, err := net.Listen("tcp", ":"+pStr)
+		if err == nil {
+			ln.Close()
+			return port
+		}
+	}
+	return 0
+}
+
 var createCmd = &cobra.Command{
 	Use:   "create [name]",
-	Short: "Create a new sandbox",
-	Long:  `Creates a new development sandbox with specified size and TTL.`,
+	Short: "Create a networked sandbox with auto-port mapping",
 	Args:  cobra.MaximumNArgs(1),
 	Run: func(cmd *cobra.Command, args []string) {
 		var name string
@@ -26,70 +42,74 @@ var createCmd = &cobra.Command{
 		} else {
 			name, _ = cmd.Flags().GetString("name")
 		}
-
 		if name == "" {
-			name = generateRandomName()
-			fmt.Printf("🎲 No name provided. Generated: %s\n", name)
+			name = pkg.GenerateRandomName()
 		}
 
 		size, _ := cmd.Flags().GetString("size")
+		customImg, _ := cmd.Flags().GetString("image")
+		restoreTag, _ := cmd.Flags().GetString("restore")
 		ttlOverride, _ := cmd.Flags().GetDuration("ttl")
 
 		spec, ok := pkg.SandboxSpecs[size]
 		if !ok {
-			fmt.Printf("❌ Error: '%s' is not a valid size. Use small, medium, large, or xlarge.\n", size)
+			fmt.Printf("❌ Invalid size: %s\n", size)
 			return
+		}
+
+		imageToUse := spec.Image
+		if customImg != "" {
+			imageToUse = customImg
 		}
 
 		storageRoot := "/home/owen/prac-str/"
 		sandboxPath := filepath.Join(storageRoot, name)
 
-		if _, err := os.Stat(sandboxPath); err == nil {
-			fmt.Printf("⚠️  Existing data found at %s\n", sandboxPath)
-			fmt.Printf("Choose action: [a]ttach, [r]ename old, [c]ancel: ")
-
-			var action string
-			fmt.Scanln(&action)
-
-			switch action {
-			case "a":
-				fmt.Println("🔗 Attaching existing data...")
-			case "r":
-				timestamp := time.Now().Format("20060102150405")
-				oldPath := fmt.Sprintf("%s_old_%s", sandboxPath, timestamp)
-				os.Rename(sandboxPath, oldPath)
-				os.MkdirAll(sandboxPath, 0755)
-				fmt.Printf("📦 Renamed old data to '%s'\n", filepath.Base(oldPath))
-			default:
-				fmt.Println("🛑 Operation cancelled")
-				return
-			}
-		} else {
-			os.MkdirAll(sandboxPath, 0755)
-		}
-
-		cli, err := client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
-		if err != nil {
-			fmt.Printf("❌ Error: Failed to initialize Docker client: %v\n", err)
-			return
-		}
+		cli, _ := client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
 		defer cli.Close()
-
 		ctx := context.Background()
 		engine := &pkg.Dockerengine{Client: cli}
 
-		if err := engine.EnsureImage(ctx, spec.Image); err != nil {
-			fmt.Printf("❌ Image Error: %v\n", err)
-			return
+		// 1. Networking and Port Logic
+		engine.EnsureNetwork(ctx)
+		usedPorts, _ := engine.GetUsedPorts(ctx)
+		hostPort := FindFreePort(8000, 9000, usedPorts)
+
+		if restoreTag != "" {
+			snapPath := filepath.Join(storageRoot, restoreTag)
+			if _, err := os.Stat(snapPath); os.IsNotExist(err) {
+				snapPath = filepath.Join(storageRoot, fmt.Sprintf("%s_snap_%s", name, restoreTag))
+			}
+			if _, err := os.Stat(snapPath); err == nil {
+				fmt.Printf("🔄 Restoring data from: %s\n", snapPath)
+				exec.Command("sudo", "rm", "-rf", sandboxPath).Run()
+				exec.Command("sudo", "cp", "-r", snapPath, sandboxPath).Run()
+			}
 		}
 
-		config := &container.Config{
-			Image: spec.Image,
+		if _, err := os.Stat(sandboxPath); err == nil && restoreTag == "" {
+			fmt.Printf("⚠️  Existing data found. [a]ttach, [r]ename, [c]ancel: ")
+			var action string
+			fmt.Scanln(&action)
+			if action == "r" {
+				oldPath := fmt.Sprintf("%s_old_%s", sandboxPath, time.Now().Format("20060102150405"))
+				os.Rename(sandboxPath, oldPath)
+				engine.RemoveSandbox(ctx, name, "", false)
+			} else if action == "a" {
+				engine.RemoveSandbox(ctx, name, "", false)
+			} else {
+				return
+			}
 		}
+		os.MkdirAll(sandboxPath, 0755)
+
+		engine.EnsureImage(ctx, imageToUse)
 
 		hostConfig := &container.HostConfig{
-			Binds: []string{
-				fmt.Sprintf("%s:/data", sandboxPath),
+			Binds:       []string{fmt.Sprintf("%s:/data", sandboxPath)},
+			NetworkMode: "sb-hub-net",
+			PortBindings: nat.PortMap{
+				"80/tcp": []nat.PortBinding{{HostIP: "0.0.0.0", HostPort: fmt.Sprintf("%d", hostPort)}},
 			},
 			Resources: container.Resources{
 				NanoCPUs: int64(spec.CPUCores * 1e9),
@@ -102,25 +122,28 @@ var createCmd = &cobra.Command{
 			finalTTL = spec.DefaultTTL
 		}
 
-		id, err := engine.CreateSandbox(ctx, name, finalTTL, config, hostConfig)
-		if err != nil {
-			fmt.Printf("❌ Create Error: %v\n", err)
-			return
+		config := &container.Config{
+			Image: imageToUse,
+			Labels: map[string]string{
+				"com.sbhub.hostport": fmt.Sprintf("%d", hostPort),
+			},
 		}
-		fmt.Printf("✅ Sandbox started! Name: %s ID: %s\n", name, id[:12])
+
+		id, err := engine.CreateSandbox(ctx, name, finalTTL, size, config, hostConfig)
+		if err != nil {
+			fmt.Printf("❌ Error: %v\n", err)
+		} else {
+			// FIXED: Now using 'id' to satisfy the Go compiler
+			fmt.Printf("✅ Started %s (ID: %s) at http://localhost:%d\n", name, id[:12], hostPort)
+		}
 	},
 }
 
-func generateRandomName() string {
-	adjectives := []string{"swift", "brave", "cool", "mighty", "keen"}
-	nouns := []string{"whale", "ship", "anchor", "pilot", "wave"}
-	r := rand.New(rand.NewSource(time.Now().UnixNano()))
-	return fmt.Sprintf("%s-%s-%d", adjectives[r.Intn(len(adjectives))], nouns[r.Intn(len(nouns))], r.Intn(1000))
-}
-
 func init() {
-	createCmd.Flags().StringP("name", "n", "", "Name of the sandbox")
-	createCmd.Flags().StringP("size", "s", "small", "Size (small, medium, large, xlarge)")
-	createCmd.Flags().DurationP("ttl", "t", 0, "Time to live override (e.g., 1h, 30m)")
+	createCmd.Flags().StringP("name", "n", "", "Sandbox name")
+	createCmd.Flags().StringP("size", "s", "small", "Size preset")
+	createCmd.Flags().StringP("image", "i", "", "Custom Docker image")
+	createCmd.Flags().StringP("restore", "r", "", "Snapshot folder or tag to restore")
+	createCmd.Flags().DurationP("ttl", "t", 0, "TTL override")
 	rootCmd.AddCommand(createCmd)
 }

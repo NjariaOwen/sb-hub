@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"text/tabwriter"
+	"time"
 
 	"github.com/NjariaOwen/sb-hub/pkg"
 	"github.com/docker/docker/client"
@@ -16,60 +17,64 @@ var listCmd = &cobra.Command{
 	Use:     "list",
 	Aliases: []string{"ls"},
 	Short:   "List all sandboxes and archived data",
-	Long:    `Displays a table of active Docker sandboxes and persistent data folders found on the host.`,
 	Run: func(cmd *cobra.Command, args []string) {
 		storageRoot := "/home/owen/prac-str"
-
-		cli, err := client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
-		if err != nil {
-			fmt.Printf("❌ Error: %v\n", err)
-			return
-		}
+		cli, _ := client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
 		defer cli.Close()
 
 		ctx := context.Background()
 		engine := &pkg.Dockerengine{Client: cli}
+		activeMap, _ := engine.GetActiveSandboxes(ctx)
 
-		activeMap, err := engine.GetActiveSandboxes(ctx)
-		if err != nil {
-			fmt.Printf("❌ Error fetching Docker status: %v\n", err)
-			return
-		}
-
-		entries, err := os.ReadDir(storageRoot)
-		if err != nil {
-			fmt.Printf("❌ Error reading storage: %v\n", err)
-			return
-		}
-
+		entries, _ := os.ReadDir(storageRoot)
+		// We add PORT to the header
 		w := tabwriter.NewWriter(os.Stdout, 0, 0, 3, ' ', tabwriter.Debug)
-		fmt.Fprintln(w, "NAME\tTYPE\tSTATUS\tDOCKER ID\tSTORAGE PATH")
+		fmt.Fprintln(w, "NAME\tTYPE\tSIZE\tSTATUS\tIMAGE\tPORT\tTTL REMAINING\tSTORAGE PATH")
 
 		for _, entry := range entries {
 			if !entry.IsDir() {
 				continue
 			}
-
 			name := entry.Name()
 			fullPath := filepath.Join(storageRoot, name)
 
 			sandboxType := "Archived 💾"
+			size := "-"
 			status := "Data Only"
-			dockerID := "-"
+			imageName := "-"
+			port := "-" // Default for archived data
+			ttlRemaining := "-"
 
 			if c, exists := activeMap[name]; exists {
 				sandboxType = "Active 🟢"
 				status = c.State
-				dockerID = c.ID[:12]
-			}
+				imageName = c.Image
+				size = c.Labels["com.sbhub.size"]
 
-			fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\n", name, sandboxType, status, dockerID, fullPath)
+				// Pull the host port from labels
+				if p, ok := c.Labels["com.sbhub.hostport"]; ok {
+					port = p
+				}
+
+				if exp, ok := c.Labels["com.sbhub.expires"]; ok {
+					t, err := time.Parse(time.RFC3339, exp)
+					if err == nil {
+						rem := time.Until(t).Round(time.Second)
+						if rem > 0 {
+							ttlRemaining = rem.String()
+						} else {
+							ttlRemaining = "EXPIRED"
+						}
+					}
+				}
+			}
+			// Added port variable to the output string
+			fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n", name, sandboxType, size, status, imageName, port, ttlRemaining, fullPath)
 		}
 		w.Flush()
 	},
 }
 
 func init() {
-
 	rootCmd.AddCommand(listCmd)
 }
